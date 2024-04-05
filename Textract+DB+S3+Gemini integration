@@ -1,0 +1,132 @@
+import boto3
+import io
+import google.generativeai as genai
+import uuid
+
+# Initialize AWS clients for Textract, DynamoDB, and S3
+textract_client = boto3.client('textract', region_name='ap-south-1')
+dynamodb_client = boto3.client('dynamodb', region_name='ap-south-1')
+s3_client = boto3.client('s3', region_name='ap-south-1')
+
+# Initialize Google AI model
+genai.configure(api_key="GEMINI API KEY HERE")  # Replace with your actual API key
+model = genai.GenerativeModel(model_name="gemini-1.0-pro", generation_config={
+    "temperature": 0.9,
+    "top_p": 1,
+    "top_k": 1,
+    "max_output_tokens": 2048,
+}, safety_settings=[
+    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
+])
+
+def extract_text_from_document_s3(bucket_name, object_key):
+    # Read the image from S3 bucket
+    response = s3_client.get_object(Bucket=bucket_name, Key=object_key)
+    document_bytes = response['Body'].read()
+    
+    # Call Textract to extract text from the document
+    response = textract_client.detect_document_text(Document={'Bytes': document_bytes})
+    
+    # Extract and process the text data as needed
+    extracted_text = process_text_response(response)
+    return extracted_text
+
+def process_text_response(response):
+    # Process the Textract response and extract relevant text data
+    extracted_text = []
+    for block in response['Blocks']:
+        if block['BlockType'] == 'LINE':
+            extracted_text.append(block['Text'])
+    return ' '.join(extracted_text)
+
+def get_most_recent_image_key(bucket_name):
+    try:
+        # List objects in the bucket
+        response = s3_client.list_objects_v2(Bucket=bucket_name, Prefix='')
+        sorted_objects = sorted(response.get('Contents', []), key=lambda obj: obj.get('LastModified', ''), reverse=True)
+        for obj in sorted_objects:
+            if obj['Key'].lower().endswith(('.png', '.jpg', '.jpeg', '.gif')):
+                return obj['Key']
+    except Exception as e:
+        print(f"Error: {e}")
+    return None
+
+def store_text_in_dynamodb(text):
+    try:
+        # Generate a unique receipt ID using UUID
+        receipt_id = str(uuid.uuid4())
+        
+        # Prepare the extracted text data for DynamoDB
+        dynamodb_data = {
+            'Receipt_ID': {'S': receipt_id},  # Unique receipt ID
+            'Text': {'S': text}  # Convert the list of text lines to a single string
+            # Add more attributes as needed
+        }
+        
+        # Call DynamoDB client to put the extracted data into your DynamoDB table
+        response = dynamodb_client.put_item(
+            TableName='Receipt_Items',
+            Item=dynamodb_data
+        )
+        return response
+    except Exception as e:
+        print(f"Error storing data in DynamoDB: {e}")
+        return None
+
+# Extract text from the most recent image in the S3 bucket and store it in DynamoDB
+def extract_text_and_store_in_dynamodb(bucket_name):
+    try:
+        object_key = get_most_recent_image_key(bucket_name)
+        if object_key:
+            extracted_text = extract_text_from_document_s3(bucket_name, object_key)
+            if extracted_text:
+                response = store_text_in_dynamodb(extracted_text)
+                if response:
+                    print("Text extracted and stored in DynamoDB successfully.")
+                else:
+                    print("Failed to store text in DynamoDB.")
+            else:
+                print("Failed to extract text from the image.")
+        else:
+            print("No image found in the bucket.")
+    except Exception as e:
+        print(f"Error: {e}")
+
+# Get the most recent text from DynamoDB and generate response using AI model
+def process_text_and_generate_model_response():
+    try:
+        response = dynamodb_client.scan(TableName='Receipt_Items', Limit=1)
+        if 'Items' in response and response['Items']:
+            recent_text = response['Items'][0]['Text']['S']
+            if recent_text:
+                classification_sentence = "Give a sustainability combined score for all the items given using the formula given- number of sustainable items/total number of items in the receipt, only print the final score in decimal format"
+                text_with_classification = f"{recent_text}\n{classification_sentence}"
+                convo = model.start_chat(history=[])
+                convo.send_message(text_with_classification)
+                model_response = convo.last.text
+                value_id = str(uuid.uuid4())
+                try:
+                    response = dynamodb.put_item(
+                        TableName='Data',
+                        Item={
+                            'Value_id': {'S': value_id},
+                            'Sustainability_Score': {'S': model_response}
+                        }
+                    )
+                    print("Model response added to DynamoDB table successfully.")
+                except Exception as e:
+                    print(f"Error adding model response to DynamoDB table: {e}")
+            else:
+                print("No recent text found in DynamoDB.")
+        else:
+            print("No items found in DynamoDB table.")
+    except Exception as e:
+        print(f"Error: {e}")
+
+# Example usage
+bucket_name = 'receiptlistfinal'
+extract_text_and_store_in_dynamodb(bucket_name)
+process_text_and_generate_model_response()
